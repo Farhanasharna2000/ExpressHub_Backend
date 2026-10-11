@@ -26,7 +26,7 @@ if (pm.response.code >= 200 && pm.response.code < 300) {
   });
 }`;
 collection.auth = bearer('accessToken');
-collection.info.description = 'All implemented API routes. Import the matching environment and read docs/postman-testing.md. Send mutations individually. Run the Role access checks folder after logging in all three roles. Saved examples are illustrative.';
+collection.info.description = 'All implemented API routes. Set baseUrl (origin only), email and password in collection variables or an optional environment. See README.md for the workflow. Authentication saves tokens; shipment creation saves shipmentId; Checkout saves paymentId and checkoutUrl. Set userId and courierId explicitly before targeted operations. Stripe webhooks require genuine signed provider events. Send mutations individually. Run the Role access checks folder after logging in all three roles. Saved examples are illustrative.';
 collection.item = collection.item.filter(x => x.name !== 'Role access checks');
 const walk = items => items.flatMap(i => i.item ? walk(i.item) : [i]);
 let items = walk(collection.item);
@@ -91,8 +91,7 @@ for (const role of ['CUSTOMER','COURIER','ADMIN']) {
 check('Missing token rejected','/api/v1/users/me',null,401);
 check('Customer cannot read another customer shipment','/api/v1/shipments/{{foreignShipmentId}}','customerToken',404);
 collection.item.push(checks);
-const keys=['baseUrl','email','password','accessToken','userId','currentUserId','currentRole','customerToken','customerId','courierToken','courierId','adminToken','adminId','shipmentId','foreignShipmentId','paymentId','idempotencyKey','paymentAttemptShipmentId','checkoutUrl'];
+const keys=['baseUrl','email','password','accessToken','userId','currentUserId','currentRole','customerToken','customerId','courierToken','courierId','adminToken','adminId','shipmentId','foreignShipmentId','paymentId','idempotencyKey','paymentAttemptShipmentId','checkoutUrl','stripeSignature'];
 collection.variable = keys.map(key=>({key,value:key==='baseUrl'?'http://localhost:3000':'',type:'string'}));
 writeFileSync(file,JSON.stringify(collection,null,2)+'\n');
-writeFileSync('docs/postman/ExpressHub.local.postman_environment.json',JSON.stringify({name:'ExpressHub local (fill privately)',values:keys.map(key=>({key,value:key==='baseUrl'?'http://localhost:3000':'',enabled:true,type:/token|password/i.test(key)?'secret':'default'})),_postman_variable_scope:'environment'},null,2)+'\n');
-console.log('Prepared complete collection, environment and 10 role access checks.');
+console.log('Prepared collection variables and 10 role access checks.');
