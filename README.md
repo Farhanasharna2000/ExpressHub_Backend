@@ -219,6 +219,17 @@ Use this endpoint to check server and database connectivity.
 
 ## API Documentation
 
+Import [the Postman collection](docs/postman/ExpressHub.postman_collection.json) for runnable requests, authentication scripts and saved response examples. [The OpenAPI specification](docs/openapi.json) documents all 34 implemented method–endpoint combinations, including payment routes and compatibility aliases.
+
+To regenerate both files from the documentation source:
+
+```bash
+node scripts/generate-api-docs.mjs
+node --test tests/postman.test.mjs
+```
+
+Generation overwrites the exported documentation and resets collection variables to empty placeholders. Keep personal credentials in your local Postman workspace.
+
 **Base URL:**
 
 ```text
@@ -231,7 +242,7 @@ http://localhost:3000/api/v1
 |--------|----------|-------------|
 | POST | /auth/register | Register user |
 | POST | /auth/login | User login |
-| POST | /auth/refresh | Refresh access token |
+| POST | /auth/refresh-token | Refresh access token |
 | POST | /auth/logout | Logout |
 
 ### Shipment APIs
@@ -254,9 +265,13 @@ Access depends on the authenticated user's role.
 | POST | /payments/initiate | Initiate Stripe Checkout |
 | POST | /payments/create | Create Checkout session |
 | GET | /payments/:paymentId | Retrieve payment details |
+| GET | /payments | List own payment history |
+| GET | /payments/my-payments | Alias for own payment history |
 | POST | /payments/webhook | Receive Stripe webhook |
+| GET | /payments/return/success | Informational Checkout return |
+| GET | /payments/return/cancel | Informational Checkout cancellation return |
 
-Some payment routes require customer authentication.
+Checkout creation requires CUSTOMER authentication. Payment detail allows the paying customer or ADMIN; history returns only the caller's own payments for CUSTOMER or ADMIN. The webhook requires a Stripe signature. Return endpoints are public and never confirm or modify payments.
 
 ## Authentication
 
@@ -341,23 +356,30 @@ The project can be tested using Postman.
 
 ### Testing Steps
 
-1. Import the ExpressHub Postman collection.
-2. Configure the collection `baseUrl` variable.
-3. Run the Customer Login API.
-4. Save the access token automatically using the collection script.
-5. Create a shipment.
-6. Initiate Checkout.
-7. Complete payment using Stripe Checkout.
-8. Verify the payment status.
+1. Import `docs/postman/ExpressHub.postman_collection.json`.
+2. Set collection `baseUrl` to `http://localhost:3000` (without `/api/v1`), and fill `email` and `password` locally.
+3. Send **Log in** in the `auth` folder as a customer. The script saves `accessToken` and the role-specific token; Postman's cookie jar retains the refresh cookie.
+4. Send **Book shipment** in `shipments`. Its script saves `shipmentId`.
+5. Send **Prepare Stripe Checkout** in `payments` using either `/create` or `/initiate`. The script generates an `idempotencyKey` and saves `paymentId` and `checkoutUrl` from a successful response.
+6. Open `checkoutUrl` and complete payment in your Stripe test environment. Forward signed events using the Stripe CLI command above; sending the illustrative webhook body alone will fail signature verification.
+7. Send **Read payment** to check the verified status. A success redirect alone does not confirm payment.
+
+Retries reuse the same idempotency key. A different shipment generates a new key; clear `idempotencyKey` explicitly when starting a new attempt for the same shipment after the previous attempt has settled unsuccessfully.
+
+For user and courier operations, set `userId` and `courierId` explicitly and log in with the required role. To run the **Role access checks** folder, first log in separately as CUSTOMER, COURIER and ADMIN, then set `foreignShipmentId` to another customer's shipment. Send mutation requests individually in workflow order.
 
 ### Postman Collection Variables
 
 | Variable | Description |
 |----------|-------------|
-| baseUrl | Backend API base URL |
+| baseUrl | Server origin, e.g. `http://localhost:3000`; omit `/api/v1` |
+| email, password | Credentials for the next login; fill locally |
 | accessToken | JWT access token |
-| customerToken | Customer authentication token |
+| customerToken, courierToken, adminToken | Automatically saved role tokens |
+| userId | Target user for profile, role, status or deletion requests |
+| courierId | Courier to assign; also populated by courier login |
 | shipmentId | Created shipment ID |
+| foreignShipmentId | Another customer's shipment for the access-denial check |
 | paymentId | Created payment ID |
 | checkoutUrl | Stripe Checkout URL |
 | idempotencyKey | Unique payment request identifier |
