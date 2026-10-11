@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 
-// Source for the non-payment API contract. No environment files or credentials are read.
+// Source for the API contract. No environment files or credentials are read.
 const str = (minLength = 1, maxLength = 100) => ({ type: "string", minLength, maxLength });
 const enumeration = (...values) => ({ type: "string", enum: values });
 const object = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
@@ -51,12 +51,16 @@ const auditQuery = [...pages, ...["actorId", "entityId", "shipmentId", "paymentI
 const errorSchema = { type: "object", required: ["success", "message", "errors"], properties: { success: { type: "boolean", enum: [false] }, message: str(1, 2000), errors: { type: "array", items: { type: "object", properties: { code: { type: "string" }, path: { type: "string" }, message: { type: "string" } } } } } };
 const descriptions = { 400: "Invalid input, malformed JSON, duplicate/unknown query parameter or invalid ID.", 401: "Missing/invalid authentication or inactive/deleted account.", 403: "Forbidden role or origin.", 404: "Missing, deleted or inaccessible resource.", 409: "Business state conflict or exhausted concurrency retries.", 413: "JSON request exceeds 16 KiB.", 415: "Expected application/json.", 429: "Rate limit exceeded.", 500: "Unexpected internal error (details withheld).", 503: "Required backend/configuration unavailable." };
 const codes = {400:"INVALID_INPUT",401:"UNAUTHENTICATED",403:"FORBIDDEN",404:"NOT_FOUND",409:"CONFLICT",413:"REQUEST_TOO_LARGE",415:"UNSUPPORTED_MEDIA_TYPE",429:"RATE_LIMITED",500:"INTERNAL_SERVER_ERROR",503:"SERVICE_UNAVAILABLE"};
-const spec = { openapi: "3.0.3", info: { title: "ExpressHub API — non-payment operations", version: "1.0.0", description: "Payment endpoints are deferred at the user's request. Admin aliases are documented for compatibility, not counted as additional business functionality. Examples contain placeholders only. Query parameters are strict and cannot be duplicated. Decimal database values are serialized as strings. HTTP HEAD and approved CORS OPTIONS are bodyless; unsupported methods use Next.js 405 responses." }, servers: [{ url: "http://localhost:3000", description: "Local development; replace with your HTTPS deployment URL" }], security: [{ bearerAuth: [] }], paths: {}, components: { securitySchemes: { bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }, refreshCookie: { type: "apiKey", in: "cookie", name: "expresshub_refresh" } }, schemas: { Error: errorSchema } } };
+const spec = { openapi: "3.0.3", info: { title: "ExpressHub API", version: "1.0.0", description: "Admin aliases are documented for compatibility, not counted as additional business functionality. Examples contain placeholders only. Query parameters are strict and cannot be duplicated. Decimal database values are serialized as strings. HTTP HEAD and approved CORS OPTIONS are bodyless; unsupported methods use Next.js 405 responses." }, servers: [{ url: "http://localhost:3000", description: "Local development; replace with your HTTPS deployment URL" }], security: [{ bearerAuth: [] }], paths: {}, components: { securitySchemes: { bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }, refreshCookie: { type: "apiKey", in: "cookie", name: "expresshub_refresh" } }, schemas: { Error: errorSchema } } };
+descriptions[422] = "Unsupported currency or invalid payment amount.";
+descriptions[502] = "Stripe request failed; retry with the same Idempotency-Key.";
+codes[422] = "INVALID_PAYMENT_AMOUNT";
+codes[502] = "PAYMENT_PROVIDER_UNAVAILABLE";
 const operations = [];
 function add(method, path, summary, data, options = {}) {
   const status = options.status ?? 200;
   const operationId = `${method}_${path.replace(/[^a-z0-9]+/gi, "_")}`;
-  const params = [...(path.includes("{id}") ? [{ name: "id", in: "path", required: true, schema: id }] : []), ...(options.query ?? [])];
+  const params = [...(path.includes("{id}") ? [{ name: "id", in: "path", required: true, schema: id }] : []), ...(options.query ?? []), ...(options.headers ?? [])];
   const example = { success: true, message: options.message ?? summary, data };
   const schema = infer(example); schema.properties.success.enum = [true];
   if (data === null) schema.properties.data = { type: "object", nullable: true };
@@ -97,6 +101,37 @@ for (const [method, source, target] of [["get","users","users"],["patch","users/
 add("get", `${prefix}/admin/dashboard-stats`, "Read dashboard statistics", stats, {description:"ADMIN only. No query parameters. One database snapshot. User/shipment counts exclude deletion; active shipments include FAILED. Payment history is retained; amounts are strings grouped by currency/status, not net revenue or refunded amounts."});
 add("get", `${prefix}/admin/audit-logs`, "Inspect audit history", {auditLogs:[audit],pagination}, {message:"Audit logs fetched successfully",query:auditQuery,description:"ADMIN only. Exact filters; historical deleted entities retained. actorId may be null for system events. details are action-dependent JSON; no mutation API."});
 for (const path of ["/api/v1/health","/api/health"]) add("get",path,"Check database readiness",{status:"ok",database:"connected",timestamp},{public:true,tag:"health",message:"API is healthy",errors:[503],description:"Read-only SELECT 1. Unversioned path is a compatibility alias. Database unavailable returns DATABASE_UNAVAILABLE."});
+const payment = { id:id.example, shipmentId:id.example, payerId:id.example, provider:"STRIPE", amount:"100", currency:"BDT", status:"PENDING", paidAt:null, refundedAt:null, createdAt:timestamp, updatedAt:timestamp };
+const paymentQuery = [...pages, query("status", payStatuses), query("shipmentId", id)];
+for (const suffix of ["create", "initiate"]) add("post", `${prefix}/payments/${suffix}`, "Prepare Stripe Checkout", {payment, checkoutUrl:"https://checkout.stripe.com/example"}, {
+  message:"Payment checkout prepared", body:object({shipmentId:id}), example:{shipmentId:"{{shipmentId}}"},
+  headers:[{name:"Idempotency-Key",in:"header",required:true,schema:{type:"string",format:"uuid"},description:"Reuse the same UUID for retries of one attempt; use a new UUID for a new attempt."}],
+  errors:[400,401,403,404,409,422,429,500,502,503],
+  description:"CUSTOMER owning an undeleted CREATED shipment only. Price and currency come from the server quote. create and initiate are aliases. Only one pending/accepted attempt per shipment. Reuse the same Idempotency-Key after network/provider errors. checkoutUrl can be null when Checkout is no longer pending/open. Initiation never confirms payment; a verified Stripe webhook settles it."
+});
+add("get", `${prefix}/payments/{id}`, "Read payment", {payment}, {message:"Payment fetched successfully",description:"Paying CUSTOMER or ADMIN; another customer receives 404, COURIER receives 403. Retains history for deleted shipments. Provider references and idempotency keys are not exposed."});
+for (const suffix of ["", "/my-payments"]) add("get", `${prefix}/payments${suffix}`, "List own payments", {payments:[payment],pagination}, {message:"Payments fetched successfully",query:paymentQuery,description:"CUSTOMER or ADMIN only. Both aliases return only the caller's own payments, including retained history for deleted shipments. Sorted by createdAt descending and ID ascending."});
+add("post", `${prefix}/payments/webhook`, "Receive Stripe webhook", {received:true}, {public:true,message:"Webhook received",errors:[400,413,500,503],headers:[{name:"Stripe-Signature",in:"header",required:true,schema:{type:"string"},description:"Stripe-generated signature over the original request bytes; use Stripe CLI for local delivery."}],description:"Provider-only endpoint; no bearer token. Requires original signed JSON body (maximum 256 KiB), valid recent signature and matching account/mode. Server verifies payment metadata, amount and currency against Stripe. Duplicate events are acknowledged without repeating changes; unrelated events are ignored. A 503 requests a retry. Send real signed events through Stripe CLI; the Postman reference body alone cannot simulate a valid payment."});
+const webhook = spec.paths[`${prefix}/payments/webhook`].post;
+webhook.requestBody = {required:true,content:{"application/json":{schema:{type:"object",additionalProperties:true,description:"Original Stripe event JSON; do not modify signed bytes."},example:{id:"evt_example",type:"checkout.session.completed",livemode:false,data:{object:{id:"cs_example"}}}}}};
+webhook.responses[413].description = "Webhook request exceeds 256 KiB.";
+webhook.responses[413].content["application/json"].example.message = "Webhook body is too large";
+const receipt = webhook.responses[200].content["application/json"].schema.properties.data;
+receipt.properties.duplicate = {type:"boolean"};
+receipt.properties.ignored = {type:"boolean"};
+for (const [suffix, checkout, message] of [
+  ["success","returned","Checkout returned. Check your authenticated payment status for confirmation."],
+  ["cancel","cancelled","Checkout was left without confirmation. The payment session may still be open."]
+]) add("get", `${prefix}/payments/return/${suffix}`, `Checkout return: ${suffix}`, {checkout,paymentConfirmed:false}, {public:true,message,errors:[],query:suffix==="success"?[query("session_id",str(1,500),"Optional Stripe redirect value; not used to confirm payment.")]:[],description:"Public informational response. Does not modify payments or shipments. Check authenticated payment detail for verified status; leaving Checkout does not expire its session."});
+for (const operation of operations.filter(o=>o.path.includes("/payments"))) {
+  const data = operation.op.responses[operation.status].content["application/json"].schema.properties.data;
+  if (data.properties?.checkoutUrl) data.properties.checkoutUrl.nullable = true;
+  const paymentSchema = data.properties?.payment ?? data.properties?.payments?.items;
+  if (paymentSchema) {
+    paymentSchema.properties.status = payStatuses;
+    for (const field of ["paidAt", "refundedAt"]) paymentSchema.properties[field] = {...date,nullable:true};
+  }
+}
 // Broaden action-dependent/nullable response fields instead of implying a single audit event shape.
 for (const op of operations) {
   const data = op.op.responses[op.status].content["application/json"].schema.properties.data;
@@ -106,15 +141,15 @@ for (const op of operations) {
     props.actorId.nullable = true;
   }
 }
-const collection = { info:{name:"ExpressHub — non-payment APIs",schema:"https://schema.getpostman.com/json/collection/v2.1.0/collection.json",description:"Payment work is deferred. Run individual requests in the documented workflow; do not run the whole collection against production. Set credentials locally, use the cookie jar, and switch accessToken for the required role. No secrets are included."},auth:{type:"bearer",bearer:[{key:"token",value:"{{accessToken}}",type:"string"}]},variable:[{key:"baseUrl",value:"http://localhost:3000"},...['accessToken','email','password','userId','shipmentId','courierId'].map(key=>({key,value:""}))],item:[] };
+const collection = { info:{name:"ExpressHub API",schema:"https://schema.getpostman.com/json/collection/v2.1.0/collection.json",description:"Run individual requests in the documented workflow; do not run the whole collection against production. Set credentials locally, use the cookie jar, and switch accessToken for the required role. No secrets are included."},auth:{type:"bearer",bearer:[{key:"token",value:"{{accessToken}}",type:"string"}]},variable:[{key:"baseUrl",value:"http://localhost:3000"},...['accessToken','email','password','userId','shipmentId','courierId'].map(key=>({key,value:""}))],item:[] };
 for (const {method,path,op,options,example,status} of operations) {
   const groupName=op.tags[0];let group=collection.item.find(g=>g.name===groupName);
   if(!group){group={name:groupName,item:[]};collection.item.push(group);}
-  const resource=path.includes("/users/")?"userId":"shipmentId";
+  const resource=path.includes("/users/")?"userId":path.includes("/payments/")?"paymentId":"shipmentId";
   const urlPath=path.replace("{id}",`{{${resource}}}`);
   const queryParams=(options.query??[]).map(p=>({key:p.name,value:String(p.schema.default??(p.name==='q'?'Dhaka':'')),disabled:!p.required,description:p.description}));
-  const request={method:method.toUpperCase(),header:options.body?[{key:"Content-Type",value:"application/json"}]:[],url:{raw:`{{baseUrl}}${urlPath}${queryParams.some(p=>!p.disabled)?'?'+queryParams.filter(p=>!p.disabled).map(p=>`${p.key}=${p.value}`).join('&'):''}`,host:["{{baseUrl}}"],path:urlPath.slice(1).split("/"),...(queryParams.length?{query:queryParams}:{})},description:op.description,
-    ...(options.public||options.cookieAuth?{auth:{type:"noauth"}}:{}),...(options.body?{body:{mode:"raw",raw:JSON.stringify(options.example,null,2),options:{raw:{language:"json"}}}}:{})};
+  const request={method:method.toUpperCase(),header:[...(op.requestBody?[{key:"Content-Type",value:"application/json"}]:[]),...(options.headers??[]).map(p=>({key:p.name,value:p.name==="Idempotency-Key"?"{{idempotencyKey}}":"{{stripeSignature}}"}))],url:{raw:`{{baseUrl}}${urlPath}${queryParams.some(p=>!p.disabled)?'?'+queryParams.filter(p=>!p.disabled).map(p=>`${p.key}=${p.value}`).join('&'):''}`,host:["{{baseUrl}}"],path:urlPath.slice(1).split("/"),...(queryParams.length?{query:queryParams}:{})},description:op.description,
+    ...(options.public||options.cookieAuth?{auth:{type:"noauth"}}:{}),...(op.requestBody?{body:{mode:"raw",raw:JSON.stringify(options.example??op.requestBody.content["application/json"].example,null,2),options:{raw:{language:"json"}}}}:{})};
   const item={name:op.summary,request,response:[{name:"Success example",originalRequest:request,status:status===201?"Created":"OK",code:status,header:[{key:"Content-Type",value:"application/json"},{key:"Cache-Control",value:"no-store"}],body:JSON.stringify(example,null,2)}]};
   if (["/api/v1/auth/register","/api/v1/auth/login","/api/v1/auth/refresh-token"].includes(path)) item.event=[{listen:"test",script:{type:"text/javascript",exec:["if (pm.response.code >= 200 && pm.response.code < 300) {", "  const data = pm.response.json().data;", "  if (data.accessToken) pm.collectionVariables.set('accessToken', data.accessToken);", "}"]}}];
   if(path==="/api/v1/auth/logout")item.event=[{listen:"test",script:{type:"text/javascript",exec:["if (pm.response.code === 200) pm.collectionVariables.unset('accessToken');"]}}];
@@ -123,6 +158,6 @@ for (const {method,path,op,options,example,status} of operations) {
 }
 mkdirSync("docs/postman",{recursive:true});
 writeFileSync("docs/openapi.json",JSON.stringify(spec,null,2)+"\n");
-writeFileSync("docs/postman/ExpressHub.non-payment.postman_collection.json",JSON.stringify(collection,null,2)+"\n");
-writeFileSync("docs/postman/ExpressHub.non-payment.postman_environment.json",JSON.stringify({name:"ExpressHub local (fill privately)",values:[{key:"baseUrl",value:"http://localhost:3000",enabled:true},{key:"email",value:"",enabled:true},{key:"password",value:"",enabled:true,type:"secret"}],_postman_variable_scope:"environment"},null,2)+"\n");
-console.info(`Generated OpenAPI and Postman documents for ${operations.length} non-payment operations.`);
+writeFileSync("docs/postman/ExpressHub.postman_collection.json",JSON.stringify(collection,null,2)+"\n");
+await import("./prepare-postman.mjs");
+console.info(`Generated OpenAPI and Postman documents for ${operations.length} operations.`);
